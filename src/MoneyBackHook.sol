@@ -149,6 +149,7 @@ library DeltaLib {
 ///         THE FOUR SWAP CASES:
 ///         1. exact-input buy  (IMD in, specified):      beforeSwap returns deltaSpecified = +fee.
 ///            PoolManager swaps (amountIn - fee) through the pool; the swapper pays amountIn.
+///            afterSwap reverts PartialFill unless the pool consumed exactly amountIn - fee.
 ///         2. exact-output buy (IMD in, unspecified):    afterSwap returns +fee on the unspecified
 ///            (IMD) side; the swapper pays poolImdIn + fee. No surcharge on buys.
 ///         3. exact-input sell (IMD out, unspecified):   afterSwap returns +fee on the unspecified
@@ -156,7 +157,12 @@ library DeltaLib {
 ///         4. exact-output sell (IMD out, specified):    beforeSwap returns deltaSpecified = +fee.
 ///            PoolManager swaps for (amountOut + fee) IMD; the swapper receives exactly amountOut.
 ///            (afterSwapReturnDelta cannot be used here: it only acts on the unspecified currency,
-///            which would be MONEYBACK.)
+///            which would be MONEYBACK.) afterSwap reverts PartialFill unless the pool produced
+///            exactly amountOut + fee.
+///         Partial fills: in cases 1 and 4 the fee is debited before the pool runs, so a swap the
+///         pool can only partly fill (price limit reached, in-range liquidity exhausted) would
+///         charge the fee on IMD that never moved. Those swaps revert; cases 2 and 3 always fee the
+///         IMD the pool actually moved, so partial fills there are fine.
 ///
 ///         ACCRUAL: inside the callbacks the hook mints PoolManager ERC-6909 claims of IMD to
 ///         itself for the amount taken. The hook never calls anything but the PoolManager inside
@@ -188,6 +194,9 @@ contract MoneyBackHook is IHooks, IUnlockCallback {
     /// @notice Required pool LP fee (static, 1.25%) and tick spacing. Any other key is rejected.
     uint24 public constant POOL_LP_FEE = 12_500;
     int24 public constant POOL_TICK_SPACING = 60;
+    /// @notice The only sqrtPriceX96 the pool may be initialized at: 2^96, a 1:1 price
+    ///         (launch.json `pool.initialPrice`). Initialization at any other price reverts.
+    uint160 public constant LAUNCH_SQRT_PRICE_X96 = 79228162514264337593543950336;
 
     /// @notice The exact hook-address flag bits this contract requires (0x20CC).
     uint160 public constant HOOK_FLAGS = HookFlags.MONEYBACK_FLAGS;
@@ -233,6 +242,10 @@ contract MoneyBackHook is IHooks, IUnlockCallback {
     error Reentrancy();
     error UnexpectedCallback();
     error InvalidAddress();
+    /// @dev The pool filled only part of an order whose specified currency is IMD (cases 1 and 4).
+    error PartialFill(uint256 expectedImd, uint256 actualImd);
+    /// @dev The pool was initialized at a price other than the launch price.
+    error InvalidInitialPrice(uint160 sqrtPriceX96);
 
     // ----------------------------------------------------------------------------------------- //
     //                                          constructor                                       //
@@ -272,7 +285,9 @@ contract MoneyBackHook is IHooks, IUnlockCallback {
     }
 
     /// @notice IMD fees accrued and not yet swept: the hook's ERC-6909 IMD claim balance.
-    ///         Invariant: pending() == sum(FeeAccrued.base + FeeAccrued.surcharge) - sum(Swept).
+    ///         Invariant for the hook's own accrual: pending() == sum(FeeAccrued.base +
+    ///         FeeAccrued.surcharge) - sum(Swept). IMD claims anyone transfers to the hook
+    ///         through the PoolManager's ERC-6909 also count and are swept to `payout`.
     function pending() public view returns (uint256) {
         return poolManager.balanceOf(address(this), _imdId);
     }
@@ -309,9 +324,14 @@ contract MoneyBackHook is IHooks, IUnlockCallback {
     /// @inheritdoc IHooks
     /// @dev Binds exactly one pool: currencies must be {MONEYBACK, IMD} (sorted), fee 12500,
     ///      tickSpacing 60, hooks == this. Records block.timestamp as the surcharge start.
-    function beforeInitialize(address, PoolKey calldata key, uint160) external override returns (bytes4) {
+    ///      PoolManager.initialize is permissionless and the key is predictable, so the starting
+    ///      price is pinned to LAUNCH_SQRT_PRICE_X96 (the launch.json initialPrice): a third party
+    ///      who initializes first cannot pick the price. They can still start the surcharge clock,
+    ///      so the factory should deploy the hook and initialize the pool in the same transaction.
+    function beforeInitialize(address, PoolKey calldata key, uint160 sqrtPriceX96) external override returns (bytes4) {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
         if (initializedAt != 0) revert AlreadyBound();
+        if (sqrtPriceX96 != LAUNCH_SQRT_PRICE_X96) revert InvalidInitialPrice(sqrtPriceX96);
 
         (address c0, address c1) = imdIsCurrency0 ? (IMD, launchToken) : (launchToken, IMD);
         if (
@@ -350,7 +370,13 @@ contract MoneyBackHook is IHooks, IUnlockCallback {
 
     /// @inheritdoc IHooks
     /// @dev Cases 2 and 3 (IMD unspecified): returns base + surcharge as the hook's delta on the
-    ///      unspecified (IMD) side and mints the same amount of IMD claims. Cases 1 and 4 return 0.
+    ///      unspecified (IMD) side and mints the same amount of IMD claims.
+    ///      Cases 1 and 4 (IMD specified): the fee was already taken in beforeSwap on
+    ///      |amountSpecified|, so this callback returns 0 but verifies the pool filled the whole
+    ///      order: `delta` is the pool's own swap delta (before the hook's take is applied), so its
+    ///      IMD side must be exactly amountIn - fee (case 1) or amountOut + fee (case 4). A partial
+    ///      fill (price limit reached or in-range liquidity exhausted) would leave the swapper
+    ///      charged the full fee on IMD the pool never moved, so it reverts PartialFill instead.
     function afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata)
         external
         override
@@ -361,11 +387,20 @@ contract MoneyBackHook is IHooks, IUnlockCallback {
         if (params.amountSpecified == 0) revert ZeroSwapAmount();
 
         (bool isSell, bool imdSpecified) = _classify(params);
-        if (imdSpecified) return (IHooks.afterSwap.selector, 0);
-
         int128 imdDelta = imdIsCurrency0 ? delta.amount0() : delta.amount1();
-        uint256 imdLeg = _abs(imdDelta);
-        uint256 total = _accrue(isSell, imdLeg);
+        uint256 poolImd = _abs(imdDelta);
+
+        if (imdSpecified) {
+            uint256 imdLeg = _abs(params.amountSpecified);
+            (uint256 baseFee, uint256 surcharge) = _fees(isSell, imdLeg);
+            // Case 1 (exact-input buy): pool swapped amountIn - fee. Case 4 (exact-output sell):
+            // pool produced amountOut + fee. Anything else is a partial fill.
+            uint256 expected = isSell ? imdLeg + baseFee + surcharge : imdLeg - baseFee - surcharge;
+            if (poolImd != expected) revert PartialFill(expected, poolImd);
+            return (IHooks.afterSwap.selector, 0);
+        }
+
+        uint256 total = _accrue(isSell, poolImd);
         return (IHooks.afterSwap.selector, _toInt128(total));
     }
 

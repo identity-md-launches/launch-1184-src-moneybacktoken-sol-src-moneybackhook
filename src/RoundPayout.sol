@@ -262,14 +262,16 @@ contract RoundPayout {
 
     /// @notice Re-sends the stored failed amounts of `roundId` to each `to`. A leg that succeeds is
     ///         cleared, counted in totalPaid and emitted as Paid; one that fails again stays stored
-    ///         and is emitted as PayFailed. Reverts NothingFailed for a recipient with nothing stored.
+    ///         and is emitted as PayFailed. A recipient with nothing stored (never failed, already
+    ///         retried, written off, or listed twice in `to`) is skipped so one such entry never
+    ///         rolls back the legs already re-sent in the same call.
     function retryFailed(uint256 roundId, address[] calldata to) external onlyOwner whenNotPaused nonReentrant {
         Round storage round = rounds[roundId];
         if (round.paidAt == 0) revert RoundNotPaid(roundId);
         address token = round.token;
         for (uint256 i; i < to.length; ++i) {
             uint256 amount = failed[roundId][to[i]];
-            if (amount == 0) revert NothingFailed(roundId, to[i]);
+            if (amount == 0) continue;
             (bool ok, bytes memory reason) = _tryTransfer(token, to[i], amount);
             if (ok) {
                 delete failed[roundId][to[i]];
