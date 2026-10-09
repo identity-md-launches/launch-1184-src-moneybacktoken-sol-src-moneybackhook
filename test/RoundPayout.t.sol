@@ -721,9 +721,15 @@ contract RoundPayoutTest is PayoutFixture {
         vm.expectRevert(abi.encodeWithSelector(RoundPayout.RoundNotPaid.selector, 2));
         payer.retryFailed(2, _arr1(bob));
 
+        // a recipient with nothing stored is skipped: no revert, no payment, no event, no state change
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(RoundPayout.NothingFailed.selector, 1, alice));
+        vm.recordLogs();
         payer.retryFailed(1, _arr1(alice));
+        vm.assertEq(vm.getRecordedLogs().length, 0, "skipped entry emits nothing");
+        vm.assertEq(token.balanceOf(alice), 10e18, "alice not paid twice");
+        (,,, uint256 fc0,, uint256 tp0) = _round(1);
+        vm.assertEq(fc0, 2, "failedCount untouched by a skipped entry");
+        vm.assertEq(tp0, 10e18, "totalPaid untouched by a skipped entry");
 
         // bob still fails: stays stored, PayFailed again; carol now fixed: paid and cleared
         token.setMode(carol, 0);
@@ -743,25 +749,33 @@ contract RoundPayoutTest is PayoutFixture {
         vm.assertEq(failedCount, 1, "one left");
         vm.assertEq(tp, 40e18, "totalPaid grows with the retry");
 
-        // retrying the same recipient twice in one call: second entry has nothing left -> revert, atomic
+        // the same recipient twice in one call: the first entry pays, the second has nothing stored
+        // and is skipped, so a duplicate can never pay twice
         token.setMode(bob, 0);
         to[0] = bob;
         to[1] = bob;
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(RoundPayout.NothingFailed.selector, 1, bob));
+        vm.recordLogs();
         payer.retryFailed(1, to);
-        vm.assertEq(payer.failed(1, bob), 20e18, "atomic: nothing changed");
-
-        vm.prank(owner);
-        payer.retryFailed(1, _arr1(bob));
-        vm.assertEq(token.balanceOf(bob), 20e18, "bob paid");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        uint256 paidEvents;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter == address(payer) && logs[i].topics[0] == keccak256("Paid(uint256,address,uint256)")) {
+                paidEvents += 1;
+            }
+        }
+        vm.assertEq(paidEvents, 1, "duplicate entry pays exactly once");
+        vm.assertEq(token.balanceOf(bob), 20e18, "bob paid once");
+        vm.assertEq(payer.failed(1, bob), 0, "bob cleared");
         (,,, failedCount,, tp) = _round(1);
         vm.assertEq(failedCount, 0, "none left");
         vm.assertEq(tp, 60e18, "all paid eventually");
-        // nothing left to retry
+        // nothing left to retry: a no-op, never a revert and never a second payment
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(RoundPayout.NothingFailed.selector, 1, bob));
         payer.retryFailed(1, _arr1(bob));
+        vm.assertEq(token.balanceOf(bob), 20e18, "no double pay");
+        (,,, failedCount,, tp) = _round(1);
+        vm.assertEq(tp, 60e18, "totalPaid stable");
     }
 
     function test_retryFailedWithInsufficientBalanceStaysStored() public {
@@ -808,13 +822,18 @@ contract RoundPayoutTest is PayoutFixture {
         (,,, uint256 failedCount,, uint256 tp) = _round(1);
         vm.assertEq(failedCount, 0, "failedCount decremented");
         vm.assertEq(tp, 40e18, "totalPaid unchanged by a write-off");
-        // can't write off or retry twice
+        // can't write off twice; a retry of a written-off leg is skipped and pays nothing
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(RoundPayout.NothingFailed.selector, 1, bob));
         payer.writeOffFailed(1, bob);
+        token.setMode(bob, 0);
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(RoundPayout.NothingFailed.selector, 1, bob));
         payer.retryFailed(1, _arr1(bob));
+        vm.assertEq(token.balanceOf(bob), 0, "written-off leg is never paid by a retry");
+        vm.assertEq(token.balanceOf(address(payer)), balBefore, "no tokens moved");
+        (,,, failedCount,, tp) = _round(1);
+        vm.assertEq(failedCount, 0, "failedCount stays zero");
+        vm.assertEq(tp, 40e18, "totalPaid unchanged");
     }
 
     // ---------------------------------------- reentrancy ---------------------------------------- //

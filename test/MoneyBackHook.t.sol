@@ -130,6 +130,10 @@ contract MockERC20 {
 ///        - sync / settle / take settlement.
 ///      The curve is a constant 1:1 price with the LP fee taken from the input (pips), so every
 ///      expected amount in the tests is exact integer arithmetic.
+///      `maxOut` (0 = unlimited) models in-range liquidity running out / a price limit being hit:
+///      the pool never delivers more than `maxOut` of the output currency and consumes only the
+///      input that output costs, which is how v4 reports a partially filled exact-input or
+///      exact-output order (the swap delta is smaller than the amount specified, no revert).
 contract MockPoolManager is IPoolManager {
     using DeltaLib for BalanceDelta;
 
@@ -161,6 +165,13 @@ contract MockPoolManager is IPoolManager {
     /// @dev Hook delta of the last swap, as charged to the hook.
     BalanceDelta public lastHookDelta;
     uint256 public swapCount;
+    /// @dev Liquidity cap on the output currency per swap; 0 = unlimited (full fills).
+    uint256 public maxOut;
+
+    /// @dev Test-only: cap the output the pool can deliver (partial fills). 0 restores full fills.
+    function setMaxOut(uint256 cap) external {
+        maxOut = cap;
+    }
 
     function _hasFlag(address hooks, uint160 flag) internal pure returns (bool) {
         return uint160(hooks) & flag != 0;
@@ -272,14 +283,21 @@ contract MockPoolManager is IPoolManager {
         swapCount += 1;
     }
 
-    function _poolSwap(uint24 fee, bool zeroForOne, int256 amountToSwap) internal pure returns (BalanceDelta) {
+    function _poolSwap(uint24 fee, bool zeroForOne, int256 amountToSwap) internal view returns (BalanceDelta) {
         uint256 amountIn;
         uint256 amountOut;
+        uint256 cap = maxOut;
         if (amountToSwap < 0) {
             amountIn = uint256(-amountToSwap);
             amountOut = amountIn * (PIPS - fee) / PIPS;
+            if (cap != 0 && amountOut > cap) {
+                // liquidity ran out: only the input that buys `cap` output is consumed
+                amountOut = cap;
+                amountIn = (amountOut * PIPS + (PIPS - fee) - 1) / (PIPS - fee);
+            }
         } else {
             amountOut = uint256(amountToSwap);
+            if (cap != 0 && amountOut > cap) amountOut = cap;
             amountIn = (amountOut * PIPS + (PIPS - fee) - 1) / (PIPS - fee);
         }
         int128 inDelta = -int128(uint128(amountIn));
@@ -555,6 +573,26 @@ abstract contract HookFixture is TestBase {
     function _abs(int256 x) internal pure returns (uint256) {
         return x < 0 ? uint256(-x) : uint256(x);
     }
+
+    /// @dev Builds a pool BalanceDelta with `imdAmt` on the IMD side and `tokAmt` on the MONEYBACK side.
+    function _delta(int128 imdAmt, int128 tokAmt) internal view returns (BalanceDelta d) {
+        (int128 a0, int128 a1) = imdIs0 ? (imdAmt, tokAmt) : (tokAmt, imdAmt);
+        assembly ("memory-safe") {
+            d := or(shl(128, a0), and(sub(shl(128, 1), 1), a1))
+        }
+    }
+
+    /// @dev Expected output of the mock pool for `amountIn`, after the LP fee and the `maxOut` cap.
+    function _poolOutFor(uint256 amountIn) internal view returns (uint256 out) {
+        out = amountIn * (PIPS - LP_FEE) / PIPS;
+        uint256 cap = pm.maxOut();
+        if (cap != 0 && out > cap) out = cap;
+    }
+
+    /// @dev Exact input the mock pool charges for `amountOut` (ceil), the same maths as the mock.
+    function _poolInFor(uint256 amountOut) internal pure returns (uint256) {
+        return (amountOut * PIPS + (PIPS - LP_FEE) - 1) / (PIPS - LP_FEE);
+    }
 }
 
 // ============================================================================================= //
@@ -752,6 +790,24 @@ contract MoneyBackHookTest is HookFixture {
         vm.prank(address(pm));
         vm.expectRevert(MoneyBackHook.InvalidPoolKey.selector);
         hook.beforeInitialize(address(this), k, 1 << 96);
+    }
+
+    function test_initializeRejectsWrongPrice() public {
+        // PoolManager.initialize is permissionless: a front-runner cannot pick the starting price.
+        uint160 launch = 79228162514264337593543950336;
+        vm.assertEq(uint256(hook.LAUNCH_SQRT_PRICE_X96()), uint256(launch), "launch price constant");
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.InvalidInitialPrice.selector, launch - 1));
+        pm.initialize(key, launch - 1);
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.InvalidInitialPrice.selector, launch + 1));
+        pm.initialize(key, launch + 1);
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.InvalidInitialPrice.selector, uint160(0)));
+        pm.initialize(key, 0);
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.InvalidInitialPrice.selector, type(uint160).max));
+        pm.initialize(key, type(uint160).max);
+        vm.assertEq(hook.initializedAt(), 0, "still unbound after every bad price");
+        // the right price binds
+        pm.initialize(key, launch);
+        vm.assertEq(hook.initializedAt(), T0, "bound at the launch price");
     }
 
     function test_initializeRejectsWrongHooksField() public {
@@ -955,13 +1011,194 @@ contract MoneyBackHookTest is HookFixture {
 
     function test_afterSwapReturnsZeroWhenImdSpecified() public {
         _initPool();
+        // Case 1, full fill: the pool consumed exactly amountIn - fee of IMD.
+        uint256 fee = 1e18 * 425 / BPS;
+        BalanceDelta full = _delta(-int128(uint128(1e18 - fee)), int128(uint128(_poolOutFor(1e18 - fee))));
         vm.prank(address(pm));
-        (, int128 d) = hook.afterSwap(address(swapper), key, _params(false, true, 1e18), BalanceDelta.wrap(0), "");
+        (, int128 d) = hook.afterSwap(address(swapper), key, _params(false, true, 1e18), full, "");
         vm.assertEq(int256(d), 0, "after-delta zero for exact-input buy");
+        // Case 4, full fill at t=0: the pool produced exactly amountOut + base + surcharge of IMD.
+        uint256 feeSell = fee + 1e18 * 2000 / BPS;
+        full = _delta(int128(uint128(1e18 + feeSell)), -int128(uint128(_poolInFor(1e18 + feeSell))));
         vm.prank(address(pm));
-        (, d) = hook.afterSwap(address(swapper), key, _params(true, false, 1e18), BalanceDelta.wrap(0), "");
+        (, d) = hook.afterSwap(address(swapper), key, _params(true, false, 1e18), full, "");
         vm.assertEq(int256(d), 0, "after-delta zero for exact-output sell");
         vm.assertEq(hook.pending(), 0, "nothing minted");
+    }
+
+    function test_afterSwapRevertsPartialFillWhenImdSpecified() public {
+        _initPool();
+        uint256 fee = 1e18 * 425 / BPS;
+        uint256 expectedBuy = 1e18 - fee;
+        // Case 1: the pool moved one wei less IMD than the order net of the fee -> PartialFill.
+        BalanceDelta d = _delta(-int128(uint128(expectedBuy - 1)), 1);
+        vm.prank(address(pm));
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.PartialFill.selector, expectedBuy, expectedBuy - 1));
+        hook.afterSwap(address(swapper), key, _params(false, true, 1e18), d, "");
+        // ... and a zero delta (nothing moved at all)
+        vm.prank(address(pm));
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.PartialFill.selector, expectedBuy, 0));
+        hook.afterSwap(address(swapper), key, _params(false, true, 1e18), BalanceDelta.wrap(0), "");
+        // ... and one wei more (never produced by v4, but the equality must be strict both ways)
+        d = _delta(-int128(uint128(expectedBuy + 1)), 1);
+        vm.prank(address(pm));
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.PartialFill.selector, expectedBuy, expectedBuy + 1));
+        hook.afterSwap(address(swapper), key, _params(false, true, 1e18), d, "");
+
+        // Case 4 at t=0: the pool produced less IMD than amountOut + base + surcharge -> PartialFill.
+        uint256 expectedSell = 1e18 + fee + 1e18 * 2000 / BPS;
+        d = _delta(int128(uint128(expectedSell - 1)), -1);
+        vm.prank(address(pm));
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.PartialFill.selector, expectedSell, expectedSell - 1));
+        hook.afterSwap(address(swapper), key, _params(true, false, 1e18), d, "");
+        // the surcharge is part of the expectation: after the window only the base fee is expected
+        vm.warp(T0 + 1800);
+        d = _delta(int128(uint128(expectedSell)), -1);
+        vm.prank(address(pm));
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.PartialFill.selector, 1e18 + fee, expectedSell));
+        hook.afterSwap(address(swapper), key, _params(true, false, 1e18), d, "");
+        vm.assertEq(hook.pending(), 0, "nothing minted on any revert");
+    }
+
+    // --------------------------------------- partial fills -------------------------------------- //
+
+    /// @dev Case 1 through the manager: the pool runs out of MONEYBACK before amountIn - fee is
+    ///      consumed. The whole swap reverts PartialFill, so the hook never keeps a fee on IMD
+    ///      the pool did not move and the swapper keeps every wei.
+    function test_partialFill_exactInputBuy_reverts() public {
+        _initPool();
+        uint256 amount = 1000e18;
+        uint256 fee = amount * 425 / BPS;
+        uint256 cap = 300e18;
+        pm.setMaxOut(cap);
+        uint256 imdBefore = imd.balanceOf(address(swapper));
+        uint256 tokBefore = token.balanceOf(address(swapper));
+        uint256 consumed = _poolInFor(cap);
+        vm.assertTrue(consumed < amount - fee, "the cap binds");
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.PartialFill.selector, amount - fee, consumed));
+        swapper.swap(key, _params(false, true, amount));
+        vm.assertEq(hook.pending(), 0, "no fee kept on a reverted swap");
+        vm.assertEq(imd.balanceOf(address(swapper)), imdBefore, "swapper IMD untouched");
+        vm.assertEq(token.balanceOf(address(swapper)), tokBefore, "swapper MONEYBACK untouched");
+        vm.assertFalse(pm.unlocked(), "lock released");
+        // a cap that does not bind leaves the swap untouched
+        pm.setMaxOut(amount);
+        _swapAndCheck(false, true, amount, 0);
+    }
+
+    /// @dev Case 4 through the manager: the pool cannot produce amountOut + fee of IMD.
+    function test_partialFill_exactOutputSell_reverts() public {
+        _initPool();
+        uint256 amount = 1000e18;
+        uint256 feeT0 = amount * 425 / BPS + amount * 2000 / BPS;
+        uint256 cap = 500e18;
+        pm.setMaxOut(cap);
+        uint256 imdBefore = imd.balanceOf(address(swapper));
+        uint256 tokBefore = token.balanceOf(address(swapper));
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.PartialFill.selector, amount + feeT0, cap));
+        swapper.swap(key, _params(true, false, amount));
+        vm.assertEq(hook.pending(), 0, "no fee kept on a reverted swap");
+        vm.assertEq(imd.balanceOf(address(swapper)), imdBefore, "swapper IMD untouched");
+        vm.assertEq(token.balanceOf(address(swapper)), tokBefore, "swapper MONEYBACK untouched");
+        // the cap is exactly the gross amount: full fill, normal fee
+        pm.setMaxOut(amount + feeT0);
+        _swapAndCheck(true, false, amount, 0);
+        // one wei short of the gross amount: partial, reverts
+        pm.setMaxOut(amount + feeT0 - 1);
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.PartialFill.selector, amount + feeT0, amount + feeT0 - 1));
+        swapper.swap(key, _params(true, false, amount));
+    }
+
+    /// @dev Case 2 through the manager: the pool delivers less MONEYBACK than asked, so it takes
+    ///      less IMD. The fee is 4.25% of the IMD actually moved, not of what a full fill would cost.
+    function test_partialFill_exactOutputBuy_feesActualImd() public {
+        _initPool();
+        uint256 amount = 1000e18;
+        uint256 cap = 250e18;
+        pm.setMaxOut(cap);
+        uint256 total = _swapAndCheck(false, false, amount, 0);
+        uint256 poolImd = _poolInFor(cap);
+        vm.assertEq(_abs(_imdDelta(pm.lastPoolDelta())), poolImd, "pool moved IMD for the capped output only");
+        vm.assertEq(total, poolImd * 425 / BPS, "fee on the IMD actually moved");
+        vm.assertTrue(total < _poolInFor(amount) * 425 / BPS, "strictly less than a full-fill fee");
+        vm.assertEq(_abs(_tokenDelta(pm.lastPoolDelta())), cap, "swapper got the capped output");
+    }
+
+    /// @dev Case 3 through the manager: the pool delivers less IMD than the input is worth; the fee
+    ///      and surcharge apply to the delivered IMD only.
+    function test_partialFill_exactInputSell_feesActualImd() public {
+        _initPool();
+        vm.warp(T0 + 900);
+        uint256 amount = 1000e18;
+        uint256 cap = 400e18;
+        pm.setMaxOut(cap);
+        uint256 imdBefore = imd.balanceOf(address(swapper));
+        uint256 total = _swapAndCheck(true, true, amount, 900);
+        vm.assertEq(_abs(_imdDelta(pm.lastPoolDelta())), cap, "pool delivered the cap");
+        vm.assertEq(total, cap * 425 / BPS + cap * 1000 / BPS, "base + surcharge on delivered IMD");
+        vm.assertEq(imd.balanceOf(address(swapper)) - imdBefore, cap - total, "seller receives cap - take");
+        // the seller only paid the MONEYBACK the capped output cost
+        vm.assertEq(_abs(_tokenDelta(pm.lastPoolDelta())), _poolInFor(cap), "input consumed matches the cap");
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function testFuzz_partialFill_allCases(uint256 amount, uint256 cap, uint256 elapsed, uint8 caseSel) public {
+        _initPool();
+        amount = _bound(amount, 1, 1e25);
+        cap = _bound(cap, 1, 1e25);
+        elapsed = _bound(elapsed, 0, 3600);
+        bool isSell = caseSel & 1 == 1;
+        bool exactInput = caseSel & 2 == 2;
+        vm.warp(T0 + elapsed);
+        pm.setMaxOut(cap);
+
+        bool imdSpecified = exactInput ? !isSell : isSell;
+        if (!imdSpecified) {
+            // cases 2 and 3 always succeed and fee the IMD the pool actually moved (checked inside)
+            uint256 total = _swapAndCheck(isSell, exactInput, amount, elapsed);
+            uint256 poolImd = _abs(_imdDelta(pm.lastPoolDelta()));
+            uint256 expected = poolImd * 425 / BPS + (isSell ? poolImd * _surchargeBps(elapsed) / BPS : 0);
+            vm.assertEq(total, expected, "fee on moved IMD");
+            return;
+        }
+        // cases 1 and 4: full fill behaves as before, a binding cap reverts PartialFill
+        (bool binds, uint256 poolImdExpected, uint256 actual) = _capBinds(isSell, amount, cap, elapsed);
+        if (!binds) {
+            _swapAndCheck(isSell, exactInput, amount, elapsed);
+            return;
+        }
+        _expectPartialFill(isSell, exactInput, amount, poolImdExpected, actual);
+    }
+
+    /// @dev For cases 1 and 4: whether `cap` stops the pool from moving the IMD the hook expects,
+    ///      and the (expected, actual) pair PartialFill will carry.
+    function _capBinds(bool isSell, uint256 amount, uint256 cap, uint256 elapsed)
+        internal
+        view
+        returns (bool binds, uint256 poolImdExpected, uint256 actual)
+    {
+        uint256 fee = amount * 425 / BPS + (isSell ? amount * _surchargeBps(elapsed) / BPS : 0);
+        poolImdExpected = isSell ? amount + fee : amount - fee;
+        if (isSell) {
+            binds = cap < poolImdExpected;
+            actual = cap;
+        } else {
+            uint256 fullOut = poolImdExpected * (PIPS - LP_FEE) / PIPS;
+            binds = cap < fullOut;
+            actual = _poolInFor(cap);
+        }
+    }
+
+    function _expectPartialFill(bool isSell, bool exactInput, uint256 amount, uint256 expected, uint256 actual)
+        internal
+    {
+        uint256 pendingBefore = hook.pending();
+        uint256 imdBefore = imd.balanceOf(address(swapper));
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.PartialFill.selector, expected, actual));
+        swapper.swap(key, _params(isSell, exactInput, amount));
+        vm.assertEq(hook.pending(), pendingBefore, "nothing accrued on a partial fill");
+        vm.assertEq(imd.balanceOf(address(swapper)), imdBefore, "swapper untouched");
+        vm.assertFalse(pm.unlocked(), "lock released");
     }
 
     function test_tinySwapsRoundFeeDownToZero() public {
@@ -1202,12 +1439,30 @@ contract HookHandler is TestBase {
         initializedAt = hook_.initializedAt();
     }
 
+    uint256 public ghostPartialFillReverts;
+    uint256 public ghostUnexpectedReverts;
+
     function _swap(bool isSell, bool exactInput, uint256 amount) internal {
         amount = _bound(amount, 1, 1e24);
         bool zeroForOne = isSell ? !imdIs0 : imdIs0;
         SwapParams memory p = SwapParams(zeroForOne, exactInput ? -int256(amount) : int256(amount), 0);
+        uint256 pendingBefore = hook.pending();
         vm.recordLogs();
-        swapper.swap(key, p);
+        try swapper.swap(key, p) {}
+        catch (bytes memory err) {
+            // The only revert a swap may hit is PartialFill, and only when IMD is the specified
+            // currency (cases 1 and 4) while the liquidity cap binds. A reverted swap accrues nothing.
+            bool imdSpecified = exactInput ? !isSell : isSell;
+            if (bytes4(err) == MoneyBackHook.PartialFill.selector && imdSpecified && pm.maxOut() != 0) {
+                ghostPartialFillReverts += 1;
+            } else {
+                ghostUnexpectedReverts += 1;
+            }
+            if (hook.pending() != pendingBefore) ghostUnexpectedReverts += 1;
+            vm.getRecordedLogs();
+            ghostSwaps += 1;
+            return;
+        }
         Vm.Log[] memory logs = vm.getRecordedLogs();
         uint256 elapsed = block.timestamp - initializedAt;
         uint256 bps = elapsed >= 1800 ? 0 : 2000 * (1800 - elapsed) / 1800;
@@ -1243,6 +1498,12 @@ contract HookHandler is TestBase {
     function warp(uint256 delta) external {
         delta = _bound(delta, 0, 600);
         vm.warp(block.timestamp + delta);
+    }
+
+    /// @dev Toggles the pool's liquidity cap so later swaps may be partial fills (0 = full fills).
+    function setLiquidityCap(uint256 seed) external {
+        uint256 cap = seed % 3 == 0 ? 0 : _bound(seed, 1, 1e23);
+        pm.setMaxOut(cap);
     }
 
     function sweep(uint256 callerSeed) external {
@@ -1311,6 +1572,7 @@ contract MoneyBackHookInvariantTest is HookFixture {
     /// forge-config: default.invariant.depth = 40
     function invariant_feeFormulasAndLockState() public view {
         vm.assertEq(handler.ghostFormulaViolations(), 0, "every FeeAccrued matched the formula");
+        vm.assertEq(handler.ghostUnexpectedReverts(), 0, "only PartialFill in cases 1/4 under a binding cap reverts");
         vm.assertFalse(pm.unlocked(), "manager never left unlocked");
         vm.assertEq(pm.nonzeroDeltaCount(), 0, "no dangling deltas");
         vm.assertEq(hook.initializedAt(), T0, "binding never changes");
